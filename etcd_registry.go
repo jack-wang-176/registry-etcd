@@ -205,7 +205,7 @@ func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) e
 // keepRegister keep service registered status
 // maxRetry == 0 means retry forever
 func (e *etcdRegistry) keepRegister(key, val string, retryConfig *retry.Config) {
-	var failedTimes uint
+	var failedTimes uint = 0
 	delay := retryConfig.ObserveDelay
 	for retryConfig.MaxAttemptTimes == 0 || failedTimes < retryConfig.MaxAttemptTimes {
 		select {
@@ -218,48 +218,51 @@ func (e *etcdRegistry) keepRegister(key, val string, retryConfig *retry.Config) 
 		case <-time.After(delay):
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-		defer cancel()
-		resp, err := e.etcdClient.Get(ctx, key)
-		if err != nil {
-			klog.Warnf("keep register get %s failed with err: %v", key, err)
-			delay = retryConfig.RetryDelay
-			failedTimes++
-			continue
-		}
-
-		if len(resp.Kvs) == 0 {
-			klog.Infof("keep register service %s", key)
-			delay = retryConfig.RetryDelay
-			leaseID, err := e.grantLease()
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+			defer cancel()
+			resp, err := e.etcdClient.Get(ctx, key)
 			if err != nil {
-				klog.Warnf("keep register grant lease %s failed with err: %v", key, err)
+				klog.Warnf("keep register get %s failed with err: %v", key, err)
+				delay = retryConfig.RetryDelay
 				failedTimes++
-				continue
+				return
 			}
 
-			_, err = e.etcdClient.Put(ctx, key, val, clientv3.WithLease(leaseID))
-			if err != nil {
-				klog.Warnf("keep register put %s failed with err: %v", key, err)
-				failedTimes++
-				continue
-			}
+			if len(resp.Kvs) == 0 {
+				klog.Infof("keep register service %s", key)
+				delay = retryConfig.RetryDelay
+				leaseID, err := e.grantLease()
+				if err != nil {
+					klog.Warnf("keep register grant lease %s failed with err: %v", key, err)
+					failedTimes++
+					return
+				}
 
-			meta := registerMeta{
-				leaseID: leaseID,
-			}
-			meta.ctx, meta.cancel = context.WithCancel(context.Background())
-			if err := e.keepalive(&meta); err != nil {
-				klog.Warnf("keep register keepalive %s failed with err: %v", key, err)
-				failedTimes++
-				continue
-			}
-			e.meta.cancel()
-			e.meta = &meta
-			delay = retryConfig.ObserveDelay
-		}
+				_, err = e.etcdClient.Put(ctx, key, val, clientv3.WithLease(leaseID))
+				if err != nil {
+					klog.Warnf("keep register put %s failed with err: %v", key, err)
+					failedTimes++
+					return
+				}
 
-		failedTimes = 0
+				meta := registerMeta{
+					leaseID: leaseID,
+				}
+				meta.ctx, meta.cancel = context.WithCancel(context.Background())
+				if err := e.keepalive(&meta); err != nil {
+					klog.Warnf("keep register keepalive %s failed with err: %v", key, err)
+					failedTimes++
+					return
+				}
+				if e.meta != nil && e.meta.cancel != nil {
+					e.meta.cancel()
+				}
+				e.meta = &meta
+				delay = retryConfig.ObserveDelay
+			}
+			failedTimes = 0
+		}()
 	}
 	klog.Errorf("keep register service %s failed times:%d", key, failedTimes)
 }
@@ -290,20 +293,30 @@ func (e *etcdRegistry) grantLease() (clientv3.LeaseID, error) {
 }
 
 func (e *etcdRegistry) keepalive(meta *registerMeta) error {
-	keepAlive, err := e.etcdClient.KeepAlive(meta.ctx, meta.leaseID)
-	if err != nil {
-		return err
-	}
 	go func() {
-		// eat keepAlive channel to keep related lease alive.
-		klog.Infof("start keepalive lease %x for etcd registry", meta.leaseID)
-		for range keepAlive {
+		for {
 			select {
 			case <-meta.ctx.Done():
 				klog.Infof("stop keepalive lease %x for etcd registry", meta.leaseID)
 				return
 			default:
 			}
+			keepAlive, err := e.etcdClient.KeepAlive(meta.ctx, meta.leaseID)
+			if err != nil {
+				klog.Warnf("keepalive lease %x for etcd registry failed with err: %v", meta.leaseID, err)
+				time.Sleep(time.Second * 2)
+				continue
+			}
+			for range keepAlive {
+				select {
+				case <-meta.ctx.Done():
+					klog.Infof("stop keepalive lease %x for etcd registry", meta.leaseID)
+					return
+				default:
+				}
+			}
+			klog.Warnf("keepalive channel closed for lease %x for etcd registry", meta.leaseID)
+			time.Sleep(time.Second * 2)
 		}
 	}()
 	return nil
