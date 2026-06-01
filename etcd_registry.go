@@ -306,12 +306,16 @@ func (e *etcdRegistry) keepalive(meta *registerMeta) error {
 	go func() {
 		klog.Infof("start keepalive lease %x for etcd registry", meta.leaseID)
 		for {
-			for range keepAlive {
+			channelClosed := false
+			for !channelClosed {
 				select {
 				case <-meta.ctx.Done():
 					klog.Infof("stop keepalive lease %x for etcd registry", meta.leaseID)
 					return
-				default:
+				case _, ok := <-keepAlive:
+					if !ok {
+						channelClosed = true
+					}
 				}
 			}
 			klog.Warnf("keepalive channel closed for lease %x for etcd registry", meta.leaseID)
