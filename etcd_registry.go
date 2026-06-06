@@ -55,6 +55,8 @@ type registerMeta struct {
 	cancel  context.CancelFunc
 }
 
+var closeMeta registerMeta
+
 // NewEtcdRegistry creates an etcd based registry.
 func NewEtcdRegistry(endpoints []string, opts ...Option) (registry.Registry, error) {
 	cfg := &Config{
@@ -166,7 +168,7 @@ func (e *etcdRegistry) Deregister(info *registry.Info) error {
 	if err := e.deregister(info); err != nil {
 		return err
 	}
-	m := e.meta.Load()
+	m := e.meta.Swap(&closeMeta)
 	if m != nil && m.cancel != nil {
 		m.cancel()
 	}
@@ -259,11 +261,16 @@ func (e *etcdRegistry) keepRegister(key, val string, retryConfig *retry.Config) 
 					failedTimes++
 					return
 				}
-				m := e.meta.Load()
-				if m != nil && m.cancel != nil {
-					m.cancel()
+				oldMeta := e.meta.Load()
+				if oldMeta == &closeMeta {
+					meta.cancel()
+					break
 				}
-				e.meta.Store(&meta)
+				if e.meta.CompareAndSwap(oldMeta, &meta) {
+					if oldMeta != nil && oldMeta.cancel != nil {
+						oldMeta.cancel()
+					}
+				}
 				delay = retryConfig.ObserveDelay
 			}
 			failedTimes = 0
