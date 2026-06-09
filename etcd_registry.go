@@ -264,7 +264,7 @@ func (e *etcdRegistry) keepRegister(key, val string, retryConfig *retry.Config) 
 				oldMeta := e.meta.Load()
 				if oldMeta == &closeMeta {
 					meta.cancel()
-					break
+					return
 				}
 				if e.meta.CompareAndSwap(oldMeta, &meta) {
 					if oldMeta != nil && oldMeta.cancel != nil {
